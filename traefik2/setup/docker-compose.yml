@@ -1,0 +1,346 @@
+version: "3.3"
+
+networks:
+  t2_proxy:
+    external:
+      name: hassio
+  default:
+    driver: bridge
+
+services:
+  traefik:
+    container_name: 'traefik'
+    image: 'traefik:2.2.1'
+    restart: 'unless-stopped'
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - CF_API_EMAIL=$CLOUDFLARE_EMAIL
+      - CF_API_KEY=$CLOUDFLARE_API_KEY
+    command:
+      - --global.checkNewVersion=true
+      - --global.sendAnonymousUsage=true
+      - --entryPoints.http.address=:80
+      - --entryPoints.https.address=:443
+        # Allow these IPs to set the X-Forwarded-* headers - Cloudflare IPs: https://www.cloudflare.com/ips/
+      - --entrypoints.https.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/12,172.64.0.0/13,131.0.72.0/22
+      - --entryPoints.traefik.address=:8080
+      - --api=true
+#      - --api.insecure=true
+      - --serversTransport.insecureSkipVerify=true
+      - --log=true
+      - --log.level=DEBUG # (Default: error) DEBUG, INFO, WARN, ERROR, FATAL, PANIC
+      - --log.filePath=/traefik.log
+      - --accessLog=true
+      - --accessLog.filePath=/access.log
+      - --accessLog.bufferingSize=100 # Configuring a buffer of 100 lines
+#      - --accessLog.filters.statusCodes=400-499
+      - --providers.docker=true
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
+      - --providers.docker.defaultrule=Host(`{{ index .Labels "com.docker.compose.service" }}.$DOMAINNAME`)
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=hassio
+      - --providers.docker.swarmMode=false
+      - --providers.file.directory=/rules # Load dynamic configuration from one or more .toml or .yml files in a directory.
+#      - --providers.file.filename=/path/to/file # Load dynamic configuration from a file.
+      - --providers.file.watch=true # Only works on top level files in the rules folder
+#      - --certificatesResolvers.dns-cloudflare.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory # LetsEncrypt Staging Server - uncomment when testing
+      - --certificatesResolvers.dns-cloudflare.acme.email=$CLOUDFLARE_EMAIL
+      - --certificatesResolvers.dns-cloudflare.acme.storage=/acme.json
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.provider=cloudflare
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.resolvers=1.1.1.1:53,1.0.0.1:53
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.delayBeforeCheck=0 # To delay DNS check and reduce LE hitrate
+    ports:
+      - "81:80"
+      - "8080:8080"
+      - "443:443"
+    volumes:
+      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+      - $USERDIR/traefik2/rules:/rules # file provider directory
+      - $USERDIR/traefik2/acme/acme.json:/acme.json:rw 
+      - $USERDIR/traefik2/traefik.log/traefik.log/:/traefik.log:rw # for fail2ban - make sure to touch file before starting container
+      - $USERDIR/traefik2/traefik.log/access.log:/access.log:rw # for fail2ban - make sure to touch file before starting container
+
+
+    labels:
+      - traefik.enable=true
+      # HTTP-to-HTTPS Redirect
+      - traefik.http.routers.http-catchall.entrypoints=http
+      - traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)
+      - traefik.http.routers.http-catchall.middlewares=redirect-to-https
+      - traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https
+      # HTTP Routers
+      - traefik.http.routers.traefik-rtr.entrypoints=https
+      - traefik.http.routers.traefik-rtr.tls=true
+      - traefik.http.routers.traefik-rtr.rule=Host(`$DOMAINNAME`)
+      - traefik.http.routers.traefik-rtr.tls.domains[0].main=$DOMAINNAME
+      - traefik.http.routers.traefik-rtr.tls.domains[0].sans=*.$DOMAINNAME
+# enable it in order to get certificate
+      - traefik.http.routers.traefik-rtr.tls.certresolver=dns-cloudflare
+
+      ## Services - API
+      - traefik.http.routers.traefik-rtr.service=api@internal
+      ## Middlewares
+      - traefik.http.routers.traefik-rtr.middlewares=chain-oauth@file
+      ## optimizations
+      - traefik.frontend.entryPoints=https
+      - traefik.frontend.headers.forceSTSHeader=true
+      - traefik.frontend.headers.STSSeconds=315360000
+      - traefik.frontend.headers.STSIncludeSubdomains=true
+      - traefik.frontend.headers.STSPreload=true
+    networks:
+      - t2_proxy
+
+
+  whoami:
+    image: "containous/whoami"
+    container_name: "whoami"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami.rule=Host(`whoami.$DOMAINNAME`)
+      - traefik.http.routers.whoami.entrypoints=https
+      - traefik.http.routers.portainer.tls=true
+#      - "traefik.http.routers.whoami.tls.certresolver=dns-cloudflare"
+
+#      ## Middlewares
+#      - traefik.http.routers.whoami.middlewares=chain-oauth@file
+      ## HTTP Services
+      - "traefik.http.routers.whoami.service=whoami-svc"
+      - traefik.http.services.whoami-svc.loadbalancer.server.port=80
+    networks:
+      - t2_proxy
+
+# Google OAuth - Single Sign On using OAuth 2.0
+  # https://hub.docker.com/r/thomseddon/traefik-forward-auth
+  # https://www.smarthomebeginner.com/google-oauth-with-traefik-docker/
+  oauth:
+    container_name: oauth
+#    image: thomseddon/traefik-forward-auth:latest
+    image: thomseddon/traefik-forward-auth:2.1-arm # Use this image with Raspberry Pi
+    restart: unless-stopped
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - CLIENT_ID=$GOOGLE_CLIENT_ID
+      - CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
+      - SECRET=$OAUTH_SECRET
+      - COOKIE_DOMAIN=$DOMAINNAME
+      - INSECURE_COOKIE=false
+      - AUTH_HOST=oauth.$DOMAINNAME
+      - URL_PATH=/_oauth
+      - WHITELIST=$WHITELISTEMAILS
+      - LOG_LEVEL=info
+      - LOG_FORMAT=text
+      - LIFETIME=2592000 # 30 days
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.oauth-rtr.entrypoints=https"
+      - "traefik.http.routers.oauth-rtr.rule=Host(`oauth.$DOMAINNAME`)"
+      - "traefik.http.routers.oauth-rtr.tls=true"
+#      - "traefik.http.routers.oauth-rtr.tls.certresolver=dns-cloudflare" 
+      ## Middlewares
+      - "traefik.http.routers.oauth-rtr.middlewares=chain-oauth@file"
+      ## HTTP Services
+      - "traefik.http.routers.oauth-rtr.service=oauth-svc"
+      - "traefik.http.services.oauth-svc.loadbalancer.server.port=4181"
+    networks:
+      - t2_proxy
+
+# HA-Dockermon - Manage Docker containers in Home Assistant 
+  ha-dockermon:
+    image: philhawthorne/ha-dockermon:arm
+    container_name: ha-dockermon
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+        - "$HA_DOCKERMON_PORT:8126"
+    volumes:
+      - $USERDIR/docker/ha-dockermon:/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      PUID: $PUID
+      PGID: $PGID
+      TZ: $TZ
+    networks:
+      - t2_proxy
+
+# Watchtower - Manage Docker containers in Home Assistant 
+  Watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: portainer nextcloud inflixdb homegear grafana traefik letsencrypt ha-dockermon oauth whoami watchtower plex  --interval 30
+    networks:
+      - t2_proxy
+
+# Portainer - WebUI for Containers
+  portainer:
+    container_name: portainer
+    image: portainer/portainer:latest
+    restart: unless-stopped
+    command: -H unix:///var/run/docker.sock
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "$PORTAINER_PORT:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - $USERDIR/portainer/data:/data # Change to local directory if you want to save/transfer config locally
+    environment:
+      - TZ=$TZ
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.portainer-rtr.entrypoints=https"
+      - "traefik.http.routers.portainer-rtr.rule=Host(`portainer.$DOMAINNAME`)"
+      - "traefik.http.routers.portainer-rtr.tls=true"
+#      - "traefik.http.routers.portainer-rtr.tls.certresolver=dns-cloudflare" 
+      ## Middlewares
+#      - "traefik.http.routers.portainer-rtr.middlewares=chain-no-auth@file" # No Authentication
+#      - "traefik.http.routers.portainer-rtr.middlewares=chain-basic-auth@file" # Basic Authentication
+      - "traefik.http.routers.portainer-rtr.middlewares=chain-oauth@file" # Google OAuth 2.0
+      ## HTTP Services
+      - "traefik.http.routers.portainer-rtr.service=portainer-svc"
+      - "traefik.http.services.portainer-svc.loadbalancer.server.port=9000"
+    networks:
+      - t2_proxy
+
+# Plex 
+  plex:
+    image: linuxserver/plex
+    container_name: plex
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "32400:32400/tcp"
+      - "3005:3005/tcp"
+      - "8324:8324/tcp"
+      - "32469:32469/tcp"
+      - "1900:1900/udp" #conflicts with xTeVe
+      - "32410:32410/udp"
+      - "32412:32412/udp"
+      - "32413:32413/udp"
+      - "32414:32414/udp"
+      - "33400:33400"
+    environment:
+      TZ: $TZ
+      HOSTNAME: "hc1"
+      PLEX_CLAIM: "claim-_Kf8d_PAmyzShbVU16xY"
+      PLEX_UID: $PUID
+      PLEX_GID: $PGID
+      ADVERTISE_IP: http://$SERVER_IP:$PLEX_PORT/
+    restart: unless-stopped
+    volumes:
+      - $USERDIR/plex/config:/config
+      - /mnt/remoteseries:/tv
+      - /mnt/remotemovies:/movies
+      - /mnt/remotePictures:/pictures
+    restart: unless-stopped
+    networks:
+      - t2_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.plex-rtr.entrypoints=https"
+      - "traefik.http.routers.plex-rtr.rule=Host(`plex.$DOMAINNAME`)"
+      - "traefik.http.routers.plex-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.plex-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.plex-rtr.service=plexms-svc"
+      - "traefik.http.services.plex-svc.loadbalancer.server.port=32400"
+
+#  # PhotoShow - Image Gallery
+#  photoshow:
+#    image: linuxserver/photoshow:latest
+#    container_name: photoshow
+#    restart: unless-stopped
+#    networks:
+#      - t2_proxy
+#    security_opt:
+#      - no-new-privileges:true
+#    ports:
+#      - "$PHOTOSHOW_PORT:80"
+#    volumes:
+#      - $USERDIR/photoshow/config:/config
+#      - $USERDIR/photoshow/thumbs:/Thumbs
+#      - /mnt/remotePictures:/Pictures:ro
+#    environment:
+#      PUID: $PUID
+#      PGID: $PGID
+#      TZ: $TZ
+#    labels:
+#      - "traefik.enable=true"
+#      ## HTTP Routers
+#      - "traefik.http.routers.photoshow-rtr.entrypoints=https"
+#      - "traefik.http.routers.photoshow-rtr.rule=Host(`photoshow.$DOMAINNAME`)"
+#      - "traefik.http.routers.photoshow-rtr.tls=true"
+#      ## Middlewares
+#      - "traefik.http.routers.photoshow-rtr.middlewares=chain-authelia@file"
+#      ## HTTP Services
+#      - "traefik.http.routers.photoshow-rtr.service=photoshow-svc"
+#      - "traefik.http.services.photoshow-svc.loadbalancer.server.port=80"
+
+## SABnzbd - Binary newsgrabber (NZB downloader)
+## Disable SABNnzbd's built-in HTTPS support for traefik proxy to work
+## Needs trailing / if using PathPrefix
+#  sabnzbd:
+#    image: linuxserver/sabnzbd:latest
+#    container_name: sabnzbd
+#    restart: unless-stopped
+#    networks:
+#      - t2_proxy
+#    security_opt:
+#      - no-new-privileges:true
+#    ports:
+##      - "$SABNZBD_PORT:8081"
+#      - 8081:8080
+#      - 9090:9090
+#    volumes:
+#      - $USERDIR/sabnzbd:/config
+#      - $USERDIR/Downloads:/downloads
+##      - $USERDIR/Downloads/incomplete:/incomplete-downloads
+#    environment:
+#      PUID: $PUID
+#      PGID: $PGID
+#      TZ: $TZ
+#      UMASK_SET: 002
+#    labels:
+#      - "traefik.enable=true"
+#      ## HTTP Routers
+#      - "traefik.http.routers.sabnzbd-rtr.entrypoints=https"
+#      - "traefik.http.routers.sabnzbd-rtr.rule=Host(`sabnzbd.$DOMAINNAME`)"
+#      - "traefik.http.routers.sabnzbd-rtr.tls=true"
+###      - "traefik.http.routers.sabnzbd-rtr.tls.certresolver=dns-cloudflare" 
+#      ## Middlewares
+#      - "traefik.http.routers.sabnzbd-rtr.middlewares=chain-oauth@file"
+#      ## HTTP Services
+#      - "traefik.http.routers.sabnzbd-rtr.service=sabnzbd-svc"
+#      - "traefik.http.services.sabnzbd-svc.loadbalancer.server.port=8081"
+#    networks:
+#      - t2_proxy
+#
+## Traefik Certs Dumper - Extract LetsEncrypt Certificates - Traefik2 Compatible
+#  certdumper:
+#    container_name: traefik_certdumper
+#    image: humenius/traefik-certs-dumper:latest
+##    command: --restart-containers container1,container2,container3
+#    volumes:
+#    - $USERDIR/traefik2/acme:/traefik:ro
+#    - $USERDIR/shared/certs:/output:rw
+##    - /var/run/docker.sock:/var/run/docker.sock:ro # only needed if restarting containers
+#    environment:
+#      DOMAIN: $DOMAINNAME
+#    networks:
+#      - t2_proxy
